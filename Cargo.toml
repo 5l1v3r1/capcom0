@@ -25,6 +25,7 @@ features = [
 	"handleapi",
 	"ioapiset",
 	"memoryapi",
+	"ntsecapi",
 	"processenv",
 	"securitybaseapi",
 	"shellapi",

